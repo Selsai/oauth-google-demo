@@ -1,0 +1,9 @@
+# Ne jamais versionner des identifiants secrets
+secret.php
+
+# Dossier des dépendances Composer
+vendor/
+
+# Fichiers système
+.DS_Store
+Thumbs.db
