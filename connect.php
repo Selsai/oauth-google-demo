@@ -2,6 +2,9 @@
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/ui.php';
 
+use GuzzleHttp\Client;
+use GuzzleHttp\Exception\ClientException;
+
 if (isset($_GET['error'])) {
     render_error('Google a renvoyé une erreur : ' . $_GET['error'], 1);
 }
@@ -20,153 +23,69 @@ if (empty($_SESSION['pkce_verifier'])) {
 
 $code = $_GET['code'];
 
-// --- Échange du code contre un token (avec code_verifier PKCE) ---
-$tokenUrl = 'https://oauth2.googleapis.com/token';
-$postFields = [
-    'code'          => $code,
-    'client_id'     => GOOGLE_CLIENT_ID,
-    'client_secret' => GOOGLE_CLIENT_SECRET,
-    'redirect_uri'  => REDIRECT_URI,
-    'grant_type'    => 'authorization_code',
-    'code_verifier' => $_SESSION['pkce_verifier'],
-];
+$client = new Client([
+    'timeout' => 5.0,
+]);
 
-$ch = curl_init($tokenUrl);
-curl_setopt($ch, CURLOPT_POST, true);
-curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($postFields));
-curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-$response = curl_exec($ch);
-$curlError = curl_error($ch);
-curl_close($ch);
+try {
+    // --- Découverte automatique des endpoints Google via OpenID Connect Discovery ---
+    // (au lieu de coder les URLs en dur, on les récupère dynamiquement, comme dans les slides)
+    $discoveryResponse = $client->request('GET', 'https://accounts.google.com/.well-known/openid-configuration');
+    $discoveryJSON = json_decode((string) $discoveryResponse->getBody());
+    $tokenEndpoint = $discoveryJSON->token_endpoint;
+    $userInfoEndpoint = $discoveryJSON->userinfo_endpoint;
 
-if ($response === false) {
-    render_error('Erreur réseau lors de l\'appel à Google : ' . $curlError, 2);
-}
+    // --- Échange du code contre un access_token (+ id_token), avec le code_verifier PKCE ---
+    $accessTokenResponse = $client->request('POST', $tokenEndpoint, [
+        'form_params' => [
+            'code'          => $code,
+            'client_id'     => GOOGLE_CLIENT_ID,
+            'client_secret' => GOOGLE_CLIENT_SECRET,
+            'redirect_uri'  => REDIRECT_URI,
+            'grant_type'    => 'authorization_code',
+            'code_verifier' => $_SESSION['pkce_verifier'],
+        ],
+    ]);
 
-$tokenData = json_decode($response, true);
+    $tokenData = json_decode((string) $accessTokenResponse->getBody());
+    $accessToken = $tokenData->access_token;
+    $idToken = $tokenData->id_token ?? null;
 
-if (!isset($tokenData['access_token'])) {
-    render_error('Impossible de récupérer le token : ' . $response, 2);
-}
-
-$accessToken = $tokenData['access_token'];
-$idToken = $tokenData['id_token'] ?? null;
-$expiresIn = $tokenData['expires_in'] ?? null;
-
-$jwtPayload = null;
-
-if ($idToken) {
-    try {
-        // Vérification cryptographique complète : signature (via JWKS Google),
-        // expiration, émetteur (iss) et audience (aud).
+    // --- Vérification cryptographique complète de l'id_token (signature JWKS, iss, aud, exp) ---
+    if ($idToken) {
         $jwtPayload = verify_google_id_token($idToken);
-    } catch (Throwable $e) {
-        render_error('id_token invalide : ' . $e->getMessage(), 3);
+
+        if (isset($jwtPayload['nonce']) && $jwtPayload['nonce'] !== ($_SESSION['oauth_nonce'] ?? null)) {
+            render_error('Nonce invalide : ce token ne correspond pas à cette session.', 3);
+        }
     }
 
-    // Vérification du nonce (protection anti-rejeu, propre à notre session)
-    if (isset($jwtPayload['nonce']) && $jwtPayload['nonce'] !== ($_SESSION['oauth_nonce'] ?? null)) {
-        render_error('Nonce invalide : ce token ne correspond pas à cette session.', 3);
+    // --- Récupération du profil utilisateur via l'endpoint userinfo découvert dynamiquement ---
+    $authorizationBearer = 'Bearer ' . $accessToken;
+    $userResponse = $client->request('GET', $userInfoEndpoint, [
+        'headers' => [
+            'Authorization' => $authorizationBearer,
+        ],
+    ]);
+    $userInfos = json_decode((string) $userResponse->getBody());
+
+    // --- On n'ouvre l'accès à la page protégée que si l'email est vérifié par Google ---
+    if ($userInfos->email_verified === true) {
+        $_SESSION['email'] = $userInfos->email;
+        $_SESSION['user'] = (array) $userInfos;
+        $_SESSION['id_token_claims'] = $jwtPayload ?? null;
+        $_SESSION['expires_in'] = $tokenData->expires_in ?? null;
+
+        unset($_SESSION['oauth_state'], $_SESSION['oauth_nonce'], $_SESSION['pkce_verifier']);
+
+        header('Location: /profile.php');
+        exit();
     }
+
+    render_error("L'adresse e-mail de ce compte Google n'est pas vérifiée.", 3);
+
+} catch (ClientException $exception) {
+    render_error('Erreur lors de la communication avec Google : ' . $exception->getMessage(), 2);
+} catch (Throwable $exception) {
+    render_error('id_token invalide : ' . $exception->getMessage(), 3);
 }
-
-// --- Appel de l'endpoint userinfo ---
-$userinfoUrl = 'https://openidconnect.googleapis.com/v1/userinfo';
-$ch = curl_init($userinfoUrl);
-curl_setopt($ch, CURLOPT_HTTPHEADER, ['Authorization: Bearer ' . $accessToken]);
-curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-$userinfoResponse = curl_exec($ch);
-curl_close($ch);
-
-$userinfo = json_decode($userinfoResponse, true);
-$_SESSION['user'] = $userinfo;
-
-unset($_SESSION['oauth_state'], $_SESSION['oauth_nonce'], $_SESSION['pkce_verifier']);
-
-// Explication des claims JWT les plus courants (pour l'affichage pédagogique)
-$claimHelp = [
-    'iss' => "Émetteur du token (ici, Google)",
-    'aud' => "Destinataire prévu du token (ton client_id)",
-    'sub' => "Identifiant unique et stable de l'utilisateur chez Google",
-    'iat' => "Date de création du token (issued at)",
-    'exp' => "Date d'expiration du token",
-    'nonce' => "Valeur anti-rejeu, doit correspondre à celle envoyée au login",
-    'azp' => "Partie autorisée à utiliser ce token",
-    'at_hash' => "Empreinte du token d'accès associé",
-    'email' => "Adresse e-mail de l'utilisateur",
-    'email_verified' => "Vrai si Google a vérifié cette adresse e-mail",
-];
-
-page_start('Profil vérifié', 4);
-?>
-<div class="flex items-center gap-4 mb-2">
-  <?php if (!empty($userinfo['picture'])): ?>
-    <img src="<?= htmlspecialchars($userinfo['picture']) ?>" alt="Photo de profil"
-         class="w-16 h-16 rounded-full border-4 border-[#FFD8E8] shadow-sm">
-  <?php endif; ?>
-  <div>
-    <h1 class="font-display text-xl font-bold"><?= htmlspecialchars($userinfo['name'] ?? $userinfo['email'] ?? 'Utilisateur') ?></h1>
-    <p class="text-sm text-[#8B7F99]"><?= htmlspecialchars($userinfo['email'] ?? '') ?></p>
-  </div>
-  <?php if (!empty($userinfo['email_verified'])): ?>
-    <span class="ml-auto font-display text-[11px] font-semibold bg-[#E1F7EC] text-[#3FAE7E] px-3 py-1.5 rounded-full">✓ Vérifié</span>
-  <?php endif; ?>
-</div>
-
-<?php if ($expiresIn): ?>
-<div class="mt-4 flex items-center gap-2 bg-[#FFF7E4] text-[#C98A1E] rounded-2xl px-4 py-3 text-sm font-display font-semibold">
-  ⏳ Jeton d'accès valide encore <span id="countdown"><?= (int)$expiresIn ?></span>s
-</div>
-<?php endif; ?>
-
-<div class="mt-6 flex flex-wrap gap-2 text-[11px] font-display font-semibold">
-  <span class="px-3 py-1.5 rounded-full bg-[#EDE6FF] text-[#8A6FE0]">🔑 PKCE vérifié</span>
-  <span class="px-3 py-1.5 rounded-full bg-[#FFE4EF] text-[#FF6FA0]">🛡️ state validé</span>
-  <span class="px-3 py-1.5 rounded-full bg-[#E1F7EC] text-[#3FAE7E]">🔐 nonce validé</span>
-  <span class="px-3 py-1.5 rounded-full bg-[#FFE9C6] text-[#C98A1E]">✍️ signature JWT vérifiée</span>
-</div>
-
-<?php if ($jwtPayload): ?>
-<div class="mt-8">
-  <p class="font-display text-[12px] font-semibold text-[#B7A9C9] mb-3">CLAIMS DE L'ID TOKEN (JWT VÉRIFIÉ)</p>
-  <div class="grid sm:grid-cols-2 gap-2">
-    <?php foreach ($jwtPayload as $key => $value): ?>
-      <?php if (is_array($value)) { $value = json_encode($value); } ?>
-      <div class="bg-[#FBF7FF] border border-[#F0E6FA] rounded-xl px-3 py-2 group relative">
-        <p class="font-display text-[11px] font-bold text-[#8A6FE0]"><?= htmlspecialchars($key) ?></p>
-        <p class="text-[12px] text-[#5C5068] break-all"><?= htmlspecialchars((string)$value) ?></p>
-        <?php if (isset($claimHelp[$key])): ?>
-          <p class="text-[10px] text-[#B7A9C9] mt-1 italic"><?= htmlspecialchars($claimHelp[$key]) ?></p>
-        <?php endif; ?>
-      </div>
-    <?php endforeach; ?>
-  </div>
-</div>
-<?php endif; ?>
-
-<div class="mt-8">
-  <div class="flex items-center justify-between mb-2">
-    <p class="font-display text-[12px] font-semibold text-[#B7A9C9]">RÉPONSE DE GET /v1/userinfo</p>
-    <button onclick='copyText(<?= json_encode(json_encode($userinfo, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)) ?>, this)'
-      class="copy-btn font-display text-[11px] font-semibold text-[#8A6FE0] bg-[#EDE6FF] px-3 py-1 rounded-full">📋 Copier</button>
-  </div>
-  <pre class="bg-[#FBF7FF] border border-[#F0E6FA] rounded-2xl p-4 text-[12px] text-[#5C5068] overflow-x-auto leading-relaxed"><?= htmlspecialchars(json_encode($userinfo, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)) ?></pre>
-</div>
-
-<a href="logout.php" class="mt-8 inline-flex items-center gap-2 text-sm font-semibold text-[#FF6FA0] hover:text-[#FF4D8D] transition font-display">
-  Se déconnecter &rarr;
-</a>
-
-<script>
-launchConfetti();
-<?php if ($expiresIn): ?>
-let remaining = <?= (int)$expiresIn ?>;
-const el = document.getElementById('countdown');
-setInterval(() => {
-  remaining = Math.max(0, remaining - 1);
-  if (el) el.textContent = remaining;
-}, 1000);
-<?php endif; ?>
-</script>
-<?php
-page_end();

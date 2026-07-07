@@ -1,5 +1,7 @@
 {
     "require": {
-        "firebase/php-jwt": "^7.1"
+        "firebase/php-jwt": "^7.1",
+        "symfony/var-dumper": "^8.0",
+        "guzzlehttp/guzzle": "^7.13"
     }
 }
